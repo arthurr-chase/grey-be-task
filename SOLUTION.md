@@ -362,7 +362,7 @@ sequenceDiagram
 
 ### 5.1. Thumbnail and Preview Generation
 
-As requested by the task, the system can optionally generate previews like thumbnails for images or first-page previews for PDFs. This is handled asynchronously to avoid blocking the user.
+The system can optionally generate previews like thumbnails for images or first-page previews for PDFs. This is handled asynchronously to avoid blocking the user.
 
 1.  **Trigger**: After the **File Service** validates a newly uploaded file (Step 11 in the diagram), it publishes an event like `file_ready_for_preview` to the **Message Queue**.
 2.  **Dedicated Workers**: A separate pool of workers (or a specialized service, the `Preview Service`) consumes these events. This isolates the compute-intensive task of media processing from the core API services.
@@ -382,7 +382,6 @@ As requested by the task, the system can optionally generate previews like thumb
 
 ## 7. Strategy for Scale and Global Access
 
-The current section 7 is replaced with this more detailed one.
 
 The system is designed to handle ~10 million financial transactions and ~50 million file uploads per month, with low-latency global access.
 
