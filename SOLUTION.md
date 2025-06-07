@@ -86,6 +86,7 @@ We need three main tables for the double-entry ledger.
 *   `accounts`: Stores information about each account (e.g., Cash, Accounts Receivable).
 *   `entries`: Records individual debit and credit operations.
 *   `transactions`: Groups a set of entries that represent a single financial event. A transaction must have balanced debits and credits.
+*   `transaction_files`: Links files to transactions.
 
 **`accounts` table:**
 ```sql
@@ -119,6 +120,15 @@ CREATE TABLE transactions (
     id UUID PRIMARY KEY,
     description TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+**`transaction_files` table:**
+```sql
+CREATE TABLE transaction_files (
+    transaction_id UUID NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+    file_id UUID NOT NULL,
+    PRIMARY KEY (transaction_id, file_id)
 );
 ```
 
@@ -159,6 +169,7 @@ Creates a new financial transaction.
 ```json
 {
   "description": "Payment for services",
+  "file_ids": ["uuid-of-the-file"],
   "entries": [
     {
       "account_id": "uuid-for-cash-account",
@@ -243,7 +254,7 @@ This is critical for the `Ledger Service`.
 1.  **Database Transactions**: The creation of a transaction and its associated entries will be wrapped in a single database transaction in PostgreSQL.
     ```golang
     // Pseudocode in Go for Ledger Service
-    func (s *LedgerService) CreateTransaction(ctx context.Context, description string, entries []*Entry) (string, error) {
+    func (s *LedgerService) CreateTransaction(ctx context.Context, description string, fileIDs []string, entries []*Entry) (string, error) {
         tx, err := s.db.BeginTx(ctx, nil)
         if err != nil {
             return "", err
@@ -270,27 +281,40 @@ This is critical for the `Ledger Service`.
             return "", err
         }
 
-        // 3. Create entry records
+        // 3. Link files to the transaction
+        for _, fileID := range fileIDs {
+            _, err := tx.ExecContext(ctx, "INSERT INTO transaction_files (transaction_id, file_id) VALUES ($1, $2)", transactionID, fileID)
+            if err != nil {
+                return "", err // This will trigger the rollback
+            }
+        }
+
+        // 4. Create entry records
         for _, entry := range entries {
             _, err := tx.ExecContext(ctx, "INSERT INTO entries (transaction_id, account_id, amount, direction) VALUES ($1, $2, $3, $4)", transactionID, entry.AccountID, entry.Amount, entry.Direction)
             if err != nil {
                 return "", err // This will trigger the rollback
             }
-            // 4. Update account balances
+            // 5. Update account balances
             var operator = "+"
             if entry.Direction == "CREDIT" {
-                 // For Liability, Equity, Revenue: credit increases balance
-                 // For Asset, Expense: credit decreases balance
-                 // This logic depends on account type.
-                 // A simple approach is to have a "normal_balance" field on account (CREDIT or DEBIT)
+                 //some logic
             } else { // DEBIT
-                // ... similar logic for debit
+                // ... some logic for debit
             }
              _, err = tx.ExecContext(ctx, "UPDATE accounts SET balance = balance " + operator + " $1 WHERE id = $2", entry.Amount, entry.AccountID)
              if err != nil {
                 return "", err
              }
         }
+
+        // 5. Publish an event for other services
+        // This allows the File Service to learn about the transaction linking without being directly called.
+        eventPayload := map[string]interface{}{
+            "transaction_id": transactionID,
+            "file_ids":       fileIDs,
+        }
+        // s.messageQueue.Publish("transaction.created", eventPayload) // Fire-and-forget
 
         return transactionID, tx.Commit() // Commit the transaction
     }
@@ -470,14 +494,14 @@ sequenceDiagram
 
     Note over Client, LedgerSvc: While the file uploads, the user fills out transaction details.
 
-    Client->>APIGW: 10. POST /transactions (desc: "Office Supplies", entries: [debit expense, credit cash], file_id: "from step 7")
+    Client->>APIGW: 10. POST /transactions (desc: "Office Supplies", entries: [...], file_ids: ["from step 7"])
     APIGW->>LedgerSvc: 11. Forward request (with auth token)
     LedgerSvc->>LedgerSvc: 12. Begin DB Transaction
     LedgerSvc->>LedgerSvc: 13. Validate debits == credits
     LedgerSvc->>LedgerSvc: 14. Create `transactions` record
-    LedgerSvc->>LedgerSvc: 15. Create `entries` records
+    LedgerSvc->>LedgerSvc: 15. Create `entries` & `transaction_files` records
     LedgerSvc->>LedgerSvc: 16. Update `accounts` balances
-    LedgerSvc->>LedgerSvc: 17. Commit DB Transaction
+    LedgerSvc->>LedgerSvc: 17. Commit DB Transaction & Publish `transaction.created` event
     LedgerSvc-->>APIGW: 18. Return {transaction_id}
     APIGW-->>Client: 19. Forward response to client
     Client->>Client: 20. Show "Transaction successful" message
@@ -486,6 +510,10 @@ sequenceDiagram
     FileSvc->>FileSvc: 22. Validate uploaded file (scan, check type)
     FileSvc->>FileSvc: 23. Update file metadata (status: COMPLETED)
     FileSvc->>MsgQueue: 24. Publish "File Processed" event (for notifications)
+    
+    Note over MsgQueue, FileSvc: The File Service also listens for transaction creation events to keep its data in sync.
+    MsgQueue-->>FileSvc: 25. Consume "transaction.created" event
+    FileSvc->>FileSvc: 26. Update file metadata in DynamoDB with the transaction_id
 ```
 ![End-to-End-User-Flow](img/UseCaseFlow.png)
 
@@ -496,12 +524,13 @@ sequenceDiagram
 3.  **File Service Prepares for Upload**: The **File Service** creates a new metadata record in DynamoDB with a `PENDING` status. It then requests a secure, time-limited pre-signed URL from **Amazon S3**.
 4.  **Client Uploads File**: The **File Service** returns the pre-signed URL and a unique `file_id` to the client. The client application uses this URL to upload the receipt image directly to **S3**. This offloads the bandwidth-intensive work from our services.
 5.  **User Creates Transaction**: While the file is uploading in the background, the user fills in the transaction details (e.g., "Office Supplies," $50). Once the upload is complete, the client has the `file_id`. The user submits the form.
-6.  **Ledger Service Records Transaction**: The client sends a `POST` request to the `/transactions` endpoint. The request body contains the description, the debit/credit entries, and the `file_id` of the attached receipt. The **API Gateway** routes this to the **Ledger Service**.
-7.  **Atomicity is Key**: The **Ledger Service** performs the entire operation within a single PostgreSQL database transaction. It validates that debits equal credits, creates the transaction record, creates the associated entries, and updates the account balances. If any step fails, the entire database transaction is rolled back, ensuring data integrity. It also stores the `file_id` with the transaction.
+6.  **Ledger Service Records Transaction**: The client sends a `POST` request to the `/transactions` endpoint. The request body now contains the description, the debit/credit entries, and an array of `file_ids` of the attached receipt(s). The **API Gateway** routes this to the **Ledger Service**.
+7.  **Atomicity and Events**: The **Ledger Service** performs the entire operation within a single PostgreSQL database transaction. It validates that debits equal credits, creates the transaction record, creates the associated entries, updates account balances, and inserts records into the `transaction_files` table to link the file(s). If any step fails, the entire database transaction is rolled back. Upon a successful commit, it publishes a `transaction.created` event to the message queue.
 8.  **Asynchronous File Processing**: When the file upload to **S3** completes (Step 4), S3 automatically sends an event notification to a **Message Queue** (like SQS or Kafka).
 9.  **File Validation**: The **File Service** has a worker that consumes messages from this queue. Upon receiving the notification, it downloads the file from S3 (or accesses it), validates its content (e.g., runs a virus scan, confirms it's a valid image), and optionally generates thumbnails.
-10. **Finalize Status**: After successful processing, the **File Service** updates the file's metadata record in DynamoDB, changing the status from `PENDING` to `COMPLETED`. If processing fails, it's marked as `FAILED`.
-11. **Notifications (Optional)**: The **File Service** can publish another event (e.g., `file_processed`) to the message queue, which can be consumed by a **Notification Service** to inform the user that their receipt is successfully attached and processed.
+10. **Finalize File Status**: After successful processing, the **File Service** updates the file's metadata record in DynamoDB, changing the status from `PENDING` to `COMPLETED`.
+11. **Asynchronous Link Update**: The **File Service** also consumes the `transaction.created` event from the message queue. When it receives this event, it updates the corresponding file metadata records in its own database (DynamoDB) to include the `transaction_id`, completing the link.
+12. **Notifications (Optional)**: The **File Service** can publish another event (e.g., `file_processed`) to the message queue, which can be consumed by a **Notification Service** to inform the user that their receipt is successfully attached and processed.
 
 This flow effectively decouples the file handling from the core financial transaction logic, improving scalability and user experience. The user gets a fast response for the transaction creation while heavy file processing happens asynchronously. 
 
