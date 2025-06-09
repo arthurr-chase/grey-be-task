@@ -247,79 +247,130 @@ Links an uploaded file to a transaction.
 }
 ```
 
-## 4. Double-Entry Enforcement and Atomicity
+## 4. Data Integrity: Atomicity and Concurrency
 
-This is critical for the `Ledger Service`.
+This is the most critical part of the system design. Financial data must be perfectly consistent. We address this at two levels: ensuring each transaction is atomic (the double-entry rule) and ensuring that simultaneous operations don't corrupt account balances (concurrency control).
 
-1.  **Database Transactions**: The creation of a transaction and its associated entries will be wrapped in a single database transaction in PostgreSQL.
-    ```golang
-    // Pseudocode in Go for Ledger Service
-    func (s *LedgerService) CreateTransaction(ctx context.Context, description string, fileIDs []string, entries []*Entry) (string, error) {
-        tx, err := s.db.BeginTx(ctx, nil)
-        if err != nil {
-            return "", err
-        }
-        defer tx.Rollback() // Rollback on error
+### 4.1. The Challenge: Race Conditions in Concurrent Transactions
 
-        // 1. Validate that debits == credits
-        var totalDebits, totalCredits decimal.Decimal
-        for _, entry := range entries {
-            if entry.Direction == "DEBIT" {
-                totalDebits = totalDebits.Add(entry.Amount)
-            } else {
-                totalCredits = totalCredits.Add(entry.Amount)
-            }
-        }
-        if !totalDebits.Equal(totalCredits) {
-            return "", errors.New("debits do not equal credits")
-        }
+A critical challenge in a financial system is handling concurrent requests that affect the same data. For example, if two separate API calls try to modify the balance of the same `Cash` account at the same time, a **race condition** can occur, leading to an incorrect final balance.
 
-        // 2. Create the transaction record
-        var transactionID string
-        err = tx.QueryRowContext(ctx, "INSERT INTO transactions (description) VALUES ($1) RETURNING id", description).Scan(&transactionID)
-        if err != nil {
-            return "", err
-        }
+**Example of a Race Condition**:
+1.  Request A reads the `Cash` balance: **$100**.
+2.  Request B reads the `Cash` balance: **$100**.
+3.  Request A adds a $50 debit and calculates the new balance: $150.
+4.  Request B adds a $20 debit and calculates the new balance: $120.
+5.  Request A writes its new balance to the database: **$150**.
+6.  Request B writes its new balance to the database: **$120**.
 
-        // 3. Link files to the transaction
-        for _, fileID := range fileIDs {
-            _, err := tx.ExecContext(ctx, "INSERT INTO transaction_files (transaction_id, file_id) VALUES ($1, $2)", transactionID, fileID)
-            if err != nil {
-                return "", err // This will trigger the rollback
-            }
-        }
+The final balance is now **$120**. The $50 from Request A has been completely lost. The correct balance should have been **$170**.
 
-        // 4. Create entry records
-        for _, entry := range entries {
-            _, err := tx.ExecContext(ctx, "INSERT INTO entries (transaction_id, account_id, amount, direction) VALUES ($1, $2, $3, $4)", transactionID, entry.AccountID, entry.Amount, entry.Direction)
-            if err != nil {
-                return "", err // This will trigger the rollback
-            }
-            // 5. Update account balances
-            var operator = "+"
-            if entry.Direction == "CREDIT" {
-                 //some logic
-            } else { // DEBIT
-                // ... some logic for debit
-            }
-             _, err = tx.ExecContext(ctx, "UPDATE accounts SET balance = balance " + operator + " $1 WHERE id = $2", entry.Amount, entry.AccountID)
-             if err != nil {
-                return "", err
-             }
-        }
+### 4.2. The Solution: Atomic Transactions with Pessimistic Locking
 
-        // 5. Publish an event for other services
-        // This allows the File Service to learn about the transaction linking without being directly called.
-        eventPayload := map[string]interface{}{
-            "transaction_id": transactionID,
-            "file_ids":       fileIDs,
-        }
-        // s.messageQueue.Publish("transaction.created", eventPayload) // Fire-and-forget
+We solve both atomicity and concurrency problems using features within PostgreSQL.
 
-        return transactionID, tx.Commit() // Commit the transaction
+1.  **Database Transactions for Atomicity**: The creation of a transaction and all its associated entries will be wrapped in a single database transaction (`BEGIN`...`COMMIT`). This guarantees that the entire operation succeeds or fails as a single unit. If an error occurs midway through (e.g., one entry fails to write), the entire transaction is rolled back, preventing partial, unbalanced data from ever being saved.
+
+2.  **Pessimistic Locking for Concurrency**: To prevent the race condition described above, we use row-level pessimistic locking. Before updating an account's balance, we explicitly lock the row for that account using the `SELECT ... FOR UPDATE` SQL statement.
+
+    *   **How it Works**: When Transaction A locks the `Cash` account row, Transaction B is blocked and forced to wait. It cannot read or write to that row until Transaction A completes. This serializes access to the account balance, guaranteeing data integrity even under high concurrency.
+
+The following pseudocode shows how these concepts are combined:
+```golang
+// Pseudocode in Go for Ledger Service
+func (s *LedgerService) CreateTransaction(ctx context.Context, description string, fileIDs []string, entries []*Entry) (string, error) {
+    tx, err := s.db.BeginTx(ctx, nil)
+    if err != nil {
+        return "", err
     }
-    ```
-2.  **Constraints**: Database constraints will also be used to enforce data integrity.
+    defer tx.Rollback() // Rollback on error
+
+    // 1. Validate that debits == credits
+    var totalDebits, totalCredits decimal.Decimal
+    for _, entry := range entries {
+        if entry.Direction == "DEBIT" {
+            totalDebits = totalDebits.Add(entry.Amount)
+        } else {
+            totalCredits = totalCredits.Add(entry.Amount)
+        }
+    }
+    if !totalDebits.Equal(totalCredits) {
+        return "", errors.New("debits do not equal credits")
+    }
+
+    // 2. Create the transaction record
+    var transactionID string
+    err = tx.QueryRowContext(ctx, "INSERT INTO transactions (description) VALUES ($1) RETURNING id", description).Scan(&transactionID)
+    if err != nil {
+        return "", err
+    }
+
+    // 3. Link files to the transaction
+    for _, fileID := range fileIDs {
+        _, err := tx.ExecContext(ctx, "INSERT INTO transaction_files (transaction_id, file_id) VALUES ($1, $2)", transactionID, fileID)
+        if err != nil {
+            return "", err // This will trigger the rollback
+        }
+    }
+
+    // 4. For each entry, lock the account, create the entry, and update the balance.
+    for _, entry := range entries {
+        // STEP 4.A: Lock the account row to prevent race conditions.
+        // This query will block if another transaction has locked this same row.
+        // We also fetch the account type to determine how to apply the balance change.
+        var accountType string
+        err := tx.QueryRowContext(ctx, "SELECT type FROM accounts WHERE id = $1 FOR UPDATE", entry.AccountID).Scan(&accountType)
+        if err != nil {
+            if err == sql.ErrNoRows {
+                return "", fmt.Errorf("account with id %s not found", entry.AccountID)
+            }
+            return "", err // Other database error
+        }
+
+        // STEP 4.B: Determine the correct balance update logic based on standard accounting rules.
+        // Assets & Expenses: Increase with Debit, Decrease with Credit.
+        // Liabilities, Equity, Revenue: Decrease with Debit, Increase with Credit.
+        var amountToUpdate decimal.Decimal
+        isDebit := entry.Direction == "DEBIT"
+        
+        if accountType == "ASSET" || accountType == "EXPENSE" {
+            if isDebit {
+                amountToUpdate = entry.Amount // Increase
+            } else {
+                amountToUpdate = entry.Amount.Neg() // Decrease
+            }
+        } else { // LIABILITY, EQUITY, REVENUE
+            if isDebit {
+                amountToUpdate = entry.Amount.Neg() // Decrease
+            } else {
+                amountToUpdate = entry.Amount // Increase
+            }
+        }
+
+        // STEP 4.C: Apply the update to the account's balance.
+        _, err = tx.ExecContext(ctx, "UPDATE accounts SET balance = balance + $1, updated_at = NOW() WHERE id = $2", amountToUpdate, entry.AccountID)
+        if err != nil {
+           return "", err
+        }
+        
+        // STEP 4.D: Insert the entry record for this leg of the transaction.
+        _, err = tx.ExecContext(ctx, "INSERT INTO entries (transaction_id, account_id, amount, direction) VALUES ($1, $2, $3, $4)", transactionID, entry.AccountID, entry.Amount, entry.Direction)
+        if err != nil {
+            return "", err // This will trigger the rollback
+        }
+    }
+
+    // 5. Publish an event for other services
+    // This allows the File Service to learn about the transaction linking without being directly called.
+    eventPayload := map[string]interface{}{
+        "transaction_id": transactionID,
+        "file_ids":       fileIDs,
+    }
+    // s.messageQueue.Publish("transaction.created", eventPayload) // Fire-and-forget
+
+    return transactionID, tx.Commit() // Commit the transaction
+}
+```
 
 ## 5. File Ingestion and Delivery
 
@@ -416,14 +467,56 @@ This service is stateless, making it easier to scale horizontally.
     *   **Serving Files**: We will use a CDN like Amazon CloudFront with the S3 bucket as its origin. When a user requests to download a file, they are served from the CDN edge location physically closest to them, ensuring minimal latency.
     *   **S3 Cross-Region Replication**: To optimize for the *first* download in a new region (before it's cached by the CDN), we can use S3's Cross-Region Replication. We can have replicas of our primary bucket in key regions (e.g., `us-east-1`, `eu-west-1`, `ap-southeast-1`). Our `File Service` can be region-aware and generate a download URL pointing to the S3 bucket or CDN endpoint closest to the user.
 
-## 8. Reliability and Failure Handling
+## 8. Deployment and Hosting Strategy
+
+To ensure the system is scalable, resilient, and easy to manage, we will adopt a modern cloud-native deployment strategy. This involves containerizing our applications and using an orchestrator to manage them, along with automating the entire provisioning and deployment process.
+
+### 8.1. Containerization & Orchestration
+
+*   **Containerization (Docker)**: Each microservice (`Ledger Service`, `File Service`, `IAM Service`, etc.) will be packaged as a lightweight, standalone Docker container. This encapsulates the Go application, its dependencies, and runtime, ensuring it runs consistently across any environment (development, staging, production).
+
+*   **Orchestration (Kubernetes)**: We will use Kubernetes (or a managed equivalent like Amazon EKS, Google GKE, or Azure AKS) to orchestrate our containerized services. Kubernetes provides the essential framework for:
+    *   **Automated Scaling**: Automatically scaling the number of service pods up or down based on real-time metrics like CPU or memory usage. This is critical for handling the peak loads described in Section 7.
+    *   **Self-Healing**: Automatically restarting containers that fail, replacing unresponsive pods, and ensuring the desired number of replicas are always running.
+    *   **Service Discovery & Load Balancing**: Managing how services find and communicate with each other and distributing traffic across healthy pods.
+    *   **Rolling Deployments**: Updating services with zero downtime by incrementally replacing old pods with new ones.
+
+### 8.2. Infrastructure as Code (IaC)
+
+All underlying cloud infrastructure—including the Kubernetes cluster, PostgreSQL and DynamoDB databases, S3 buckets, Kafka cluster, and networking rules—will be managed using an Infrastructure as Code (IaC) tool like **Terraform** or **AWS CloudFormation**.
+
+*   **Benefits**:
+    *   **Repeatability**: IaC allows us to spin up an identical copy of our entire production environment for staging, testing, or disaster recovery with a single command.
+    *   **Version Control**: Infrastructure definitions are stored in Git, providing a full history of changes, the ability to review changes via pull requests, and the option to roll back to a previous state.
+    *   **Automation**: It eliminates manual configuration, reducing the risk of human error.
+
+### 8.3. CI/CD Pipeline
+
+A continuous integration and continuous deployment (CI/CD) pipeline is crucial for developer velocity and operational stability. We will use a tool like **GitHub Actions**, **GitLab CI**, or **Jenkins**.
+
+A typical pipeline for a service (e.g., `Ledger Service`) would look like this:
+
+1.  **Commit**: A developer pushes code to a feature branch in Git.
+2.  **Build & Test (CI)**: The CI server automatically triggers:
+    *   Compiling the Go code.
+    *   Running unit and integration tests.
+    *   Performing static analysis and linting.
+    *   Building a new Docker image.
+3.  **Push to Registry**: If tests pass, the Docker image is tagged and pushed to a container registry (e.g., Docker Hub, Amazon ECR, Google Container Registry).
+4.  **Deploy (CD)**:
+    *   **Staging**: A pull request to the `main` branch automatically deploys the new image to the staging environment in Kubernetes for further testing.
+    *   **Production**: After manual approval and verification, merging to the `main` branch (or creating a release tag) triggers a rolling deployment to the production Kubernetes cluster.
+
+This combined strategy ensures our system is robust, scalable, and that we can deploy new features and fixes to our users rapidly and reliably.
+
+## 9. Reliability and Failure Handling
 
 *   **Idempotency**: `POST` endpoints that create resources should be idempotent. The client can send a unique `Idempotency-Key` in the header. The server will store this key and ensure the operation is only performed once.
 *   **Retries**: For transient failures in inter-service communication, a retry mechanism with exponential backoff should be implemented.
 *   **Dead-Letter Queues (DLQs)**: If a message from the queue fails to be processed after several retries (e.g., a corrupted file that cannot be processed), it will be moved to a DLQ for manual inspection.
 *   **Backup and Restore**: PostgreSQL will have regular backups. S3 has built-in versioning and can be configured for cross-region replication for disaster recovery.
 
-## 9. Observability and Monitoring
+## 10. Observability and Monitoring
 
 *   **Metrics**: Use Prometheus to collect key metrics from services:
     *   **Ledger Service**: Transaction throughput, error rate, latency.
@@ -432,13 +525,13 @@ This service is stateless, making it easier to scale horizontally.
 *   **Tracing**: Distributed tracing (e.g., using Jaeger or OpenTelemetry) to trace requests as they flow through the microservices.
 *   **Alerting**: Configure alerts in Grafana or Alertmanager for critical issues (e.g., high error rates, high latency, queue depth increasing).
 
-## 10. Edge Cases
+## 11. Edge Cases
 
 *   **Partial Failures**: The use of database transactions in the `Ledger Service` handles partial failures during the creation of a financial event. If any step fails, the entire transaction is rolled back.
 *   **Invalid File Formats**: The `File Service` will reject files that do not match the allowed types or fail validation.
-*   **Corrupted Uploads**: If a file uploaded to S3 is found to be corrupt during processing, its status will be marked as `FAILED` in the metadata database, and the user can be notified to try again.
+*   **Corrupted Uploads**: If a file uploaded to S3 is found to be corrupt during a processing, its status will be marked as `FAILED` in the metadata database, and the user can be notified to try again.
 
-## 11. Trade-offs and Alternatives Considered
+## 12. Trade-offs and Alternatives Considered
 
 Every system design involves trade-offs. Here are some key decisions and the reasoning behind them.
 
@@ -462,7 +555,7 @@ Every system design involves trade-offs. Here are some key decisions and the rea
     *   **Reasoning**: This pattern offloads the bandwidth and compute load of handling file streams from our backend services directly to a massively scalable service (S3). It prevents our `File Service` from becoming a bottleneck.
     *   **Trade-off**: It adds a bit of complexity to the client-side logic, which must now perform a two-step process (get URL, then PUT to URL). This is a very common and worthwhile trade-off.
 
-## 12. End-to-End User Flow: Creating a Transaction with a Receipt
+## 13. End-to-End User Flow: Creating a Transaction with a Receipt
 
 This section describes a typical user flow: a user records a business expense of $50 for "Office Supplies" and attaches a photo of the receipt.
 
